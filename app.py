@@ -426,7 +426,84 @@ if st.session_state.graph is not None:
         except Exception:
             pass
 
+    # Show each table's columns so the user knows exactly what to type in PQL.
+    with st.expander("Tables & columns in this graph", expanded=True):
+        for t in st.session_state.graph_tables:
+            df = st.session_state.uploaded_tables[t]
+            cols_formatted = ", ".join(f"`{t}.{c}`" for c in df.columns)
+            st.markdown(f"**{t}** ({len(df):,} rows) — {cols_formatted}")
+
     st.markdown("#### PREDICT query (PQL)")
+
+    st.info(
+        "**Syntax:** `PREDICT <agg>(<target_table>.*, <start>, <end>, <unit>) [op value] "
+        "FOR <entity_table>.<pk_column>=<value>`\n\n"
+        "Every column in the `FOR` clause **must** be qualified with its table name "
+        "(e.g. `customers.customerid=123`, not `customerid=123`)."
+    )
+
+    # Quick query builder
+    with st.expander("🛠 Build a query from the tables", expanded=False):
+        qb_cols = st.columns(4)
+        with qb_cols[0]:
+            target_tbl = st.selectbox(
+                "Target table",
+                options=st.session_state.graph_tables,
+                key="qb_target_tbl",
+                help="The table being aggregated (e.g. transactions, balance).",
+            )
+        with qb_cols[1]:
+            entity_tbl = st.selectbox(
+                "Entity table",
+                options=st.session_state.graph_tables,
+                key="qb_entity_tbl",
+                help="The table whose rows you're predicting for.",
+            )
+        entity_cols = list(st.session_state.uploaded_tables[entity_tbl].columns)
+        with qb_cols[2]:
+            entity_col = st.selectbox(
+                "Entity column",
+                options=entity_cols,
+                key="qb_entity_col",
+                help="Typically the primary key column.",
+            )
+        with qb_cols[3]:
+            entity_val = st.text_input("Entity value", key="qb_entity_val")
+
+        qb_cols2 = st.columns(4)
+        with qb_cols2[0]:
+            agg = st.selectbox("Aggregation", options=["COUNT", "SUM", "AVG", "MIN", "MAX"], key="qb_agg")
+        with qb_cols2[1]:
+            start = st.number_input("Window start", value=0, step=1, key="qb_start")
+        with qb_cols2[2]:
+            end = st.number_input("Window end", value=30, step=1, key="qb_end")
+        with qb_cols2[3]:
+            unit = st.selectbox("Unit", options=["days", "hours", "weeks", "months"], key="qb_unit")
+
+        if agg == "COUNT":
+            agg_expr = f"COUNT({target_tbl}.*, {start}, {end}, {unit})"
+        else:
+            target_cols = list(st.session_state.uploaded_tables[target_tbl].columns)
+            target_col = st.selectbox(
+                f"{agg} column (from {target_tbl})",
+                options=target_cols,
+                key="qb_target_col",
+            )
+            agg_expr = f"{agg}({target_tbl}.{target_col}, {start}, {end}, {unit})"
+
+        threshold = st.text_input(
+            "Optional threshold (e.g. `> 0`, `>= 100`)",
+            key="qb_threshold",
+            value="> 0",
+        )
+        threshold_part = f" {threshold}" if threshold.strip() else ""
+
+        built = f"PREDICT {agg_expr}{threshold_part} FOR {entity_tbl}.{entity_col}={entity_val or '<value>'}"
+        st.code(built, language="sql")
+        if st.button("Use this query", use_container_width=True):
+            st.session_state.predict_query = built
+            st.rerun()
+
     st.text_area(
         "Predictive query",
         key="predict_query",
@@ -437,10 +514,20 @@ if st.session_state.graph is not None:
     )
 
     if st.button("▶ Run PREDICT", type="primary"):
+        # Clean common whitespace issues around `.` and `=` that break the parser.
+        import re
+        raw_query = st.session_state.predict_query
+        cleaned = re.sub(r"\s*\.\s*", ".", raw_query)   # no spaces around '.'
+        cleaned = re.sub(r"\s*=\s*", "=", cleaned)       # no spaces around '='
+        cleaned = cleaned.strip()
+
+        if cleaned != raw_query:
+            st.caption(f"Auto-cleaned query: `{cleaned}`")
+
         with st.spinner("Running prediction…"):
             try:
                 model = rfm.KumoRFM(st.session_state.graph)
-                result = model.predict(st.session_state.predict_query)
+                result = model.predict(cleaned)
                 st.session_state.predict_result = result
             except Exception as e:
                 st.session_state.predict_result = None
