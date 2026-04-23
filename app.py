@@ -62,6 +62,7 @@ for k, default in [
     ("graph", None),
     ("graph_tables", []),  # names in the built graph
     ("graph_pks", {}),  # table_name -> primary_key_column
+    ("graph_time_cols", {}),  # table_name -> time_column (or None)
     ("predict_result", None),
     ("predict_query", "PREDICT COUNT(orders.*, 0, 30, days) > 0 FOR users.user_id=1"),
 ]:
@@ -442,6 +443,20 @@ if build_clicked:
                 except Exception as e:
                     st.warning(f"Couldn't set PK on {name}: {e}")
 
+            # Capture the time_column that Graph.from_data auto-detected
+            # (it picks up any datetime-dtype column automatically).
+            time_col_guesses = {}
+            for name in chosen:
+                try:
+                    tc = graph.table(name).time_column
+                    if tc is not None:
+                        # tc is a Column object; pull its name.
+                        time_col_guesses[name] = getattr(tc, "name", None) or str(tc)
+                    else:
+                        time_col_guesses[name] = None
+                except Exception:
+                    time_col_guesses[name] = None
+
             try:
                 graph.validate()
             except Exception as ve:
@@ -450,6 +465,7 @@ if build_clicked:
             st.session_state.graph = graph
             st.session_state.graph_tables = chosen
             st.session_state.graph_pks = pk_guesses
+            st.session_state.graph_time_cols = time_col_guesses
             st.session_state.predict_result = None
             st.success(
                 f"Graph built with {len(chosen)} table(s): {', '.join(chosen)} · "
@@ -468,41 +484,84 @@ if st.session_state.graph is not None:
         except Exception:
             pass
 
-    # Show each table's columns + primary key. PQL FOR clause requires a PK.
-    with st.expander("Tables & primary keys", expanded=True):
+    # Per-table metadata: primary key (required) + time column (optional, for temporal queries).
+    with st.expander("Tables, primary keys & time columns", expanded=True):
         st.caption(
-            "The `FOR` clause must reference a **primary key** column. "
-            "Override the auto-picked PK below if needed, then click **Apply PKs**."
+            "The `FOR` clause must reference a **primary key**. A **time column** is "
+            "needed for temporal queries (`COUNT(..., 0, 30, days)`) but is optional for "
+            "static predictions (`PREDICT churn.Exited FOR churn.CustomerId=1`)."
         )
         pk_override = {}
+        time_override = {}
         for t in st.session_state.graph_tables:
             df = st.session_state.uploaded_tables[t]
-            current_pk = st.session_state.graph_pks.get(t, df.columns[0])
             cols = list(df.columns)
-            idx = cols.index(current_pk) if current_pk in cols else 0
-            c1, c2 = st.columns([1, 2])
+
+            current_pk = st.session_state.graph_pks.get(t, cols[0])
+            pk_idx = cols.index(current_pk) if current_pk in cols else 0
+
+            current_tc = st.session_state.graph_time_cols.get(t)
+            time_options = ["(none)"] + cols
+            tc_idx = time_options.index(current_tc) if current_tc in time_options else 0
+
+            st.markdown(f"**{t}** ({len(df):,} rows)")
+            c1, c2 = st.columns(2)
             with c1:
-                st.markdown(f"**{t}** ({len(df):,} rows)")
-            with c2:
                 pk_override[t] = st.selectbox(
                     f"Primary key for `{t}`",
                     options=cols,
-                    index=idx,
+                    index=pk_idx,
                     key=f"pk_select_{t}",
-                    label_visibility="collapsed",
                 )
-            st.caption("Columns: " + ", ".join(f"`{t}.{c}`" for c in df.columns))
+            with c2:
+                sel = st.selectbox(
+                    f"Time column for `{t}` (optional)",
+                    options=time_options,
+                    index=tc_idx,
+                    key=f"tc_select_{t}",
+                )
+                time_override[t] = None if sel == "(none)" else sel
+            st.caption("Columns: " + ", ".join(f"`{t}.{c}`" for c in cols))
+            st.write("")
 
-        if st.button("Apply PKs", use_container_width=True):
-            for name, pk in pk_override.items():
+        if st.button("Apply metadata", use_container_width=True):
+            for name in st.session_state.graph_tables:
                 try:
-                    st.session_state.graph.table(name).primary_key = pk
+                    st.session_state.graph.table(name).primary_key = pk_override[name]
                 except Exception as e:
                     st.error(f"Failed to set PK on {name}: {e}")
+
+                tc = time_override[name]
+                try:
+                    if tc is None:
+                        # Clear any previously-set time column
+                        st.session_state.graph.table(name).time_column = None
+                    else:
+                        # Ensure the chosen column is datetime-typed on the underlying DF.
+                        df = st.session_state.uploaded_tables[name]
+                        if not pd.api.types.is_datetime64_any_dtype(df[tc]):
+                            try:
+                                converted = pd.to_datetime(df[tc], errors="coerce")
+                                if converted.isna().all():
+                                    raise ValueError("all values failed to parse as datetime")
+                                df[tc] = converted
+                                st.session_state.uploaded_tables[name] = df
+                                st.info(f"Converted `{name}.{tc}` to datetime.")
+                            except Exception as ce:
+                                st.warning(f"Could not convert `{name}.{tc}` to datetime: {ce}")
+                        st.session_state.graph.table(name).time_column = tc
+                except Exception as e:
+                    st.error(f"Failed to set time_column on {name}: {e}")
+
             st.session_state.graph_pks = pk_override
+            st.session_state.graph_time_cols = time_override
             try:
                 st.session_state.graph.validate()
-                st.success(f"PKs applied: {', '.join(f'{t}.{pk}' for t, pk in pk_override.items())}")
+                pk_summary = ", ".join(f"{t}.{pk}" for t, pk in pk_override.items())
+                tc_summary = ", ".join(
+                    f"{t}.{tc}" for t, tc in time_override.items() if tc
+                ) or "none"
+                st.success(f"Applied. PKs: {pk_summary} · Time cols: {tc_summary}")
             except Exception as ve:
                 st.warning(f"Graph validation warning: {ve}")
 
@@ -515,69 +574,113 @@ if st.session_state.graph is not None:
         "(e.g. `customers.customerid=123`, not `customerid=123`)."
     )
 
-    # Quick query builder
-    with st.expander("🛠 Build a query from the tables", expanded=False):
-        qb_cols = st.columns(4)
-        with qb_cols[0]:
-            target_tbl = st.selectbox(
-                "Target table",
-                options=st.session_state.graph_tables,
-                key="qb_target_tbl",
-                help="The table being aggregated (e.g. transactions, balance).",
-            )
-        with qb_cols[1]:
-            entity_tbl = st.selectbox(
-                "Entity table",
-                options=st.session_state.graph_tables,
-                key="qb_entity_tbl",
-                help="The table whose rows you're predicting for.",
-            )
-        # Entity column must be the primary key of the entity table.
+    # Quick query builder — static vs temporal
+    with st.expander("🛠 Build a query from the tables", expanded=True):
+        tables_with_time = [
+            t for t in st.session_state.graph_tables
+            if st.session_state.graph_time_cols.get(t)
+        ]
+        default_mode = "Static" if not tables_with_time else "Temporal"
+        mode = st.radio(
+            "Query type",
+            options=["Static", "Temporal"],
+            index=["Static", "Temporal"].index(default_mode),
+            horizontal=True,
+            help=(
+                "**Static** — predict a column's value for one row "
+                "(no time window needed). "
+                "**Temporal** — aggregate a child table over a time window "
+                "(requires at least one table with a time column)."
+            ),
+        )
+
+        # Common: entity table, entity PK, entity value
+        entity_tbl = st.selectbox(
+            "Entity table (who/what you're predicting for)",
+            options=st.session_state.graph_tables,
+            key="qb_entity_tbl",
+        )
         pk_for_entity = st.session_state.graph_pks.get(entity_tbl)
         entity_cols = [pk_for_entity] if pk_for_entity else list(
             st.session_state.uploaded_tables[entity_tbl].columns
         )
-        with qb_cols[2]:
+        qb_row = st.columns(2)
+        with qb_row[0]:
             entity_col = st.selectbox(
-                "Entity column (PK)",
+                "Entity column (must be PK)",
                 options=entity_cols,
                 key="qb_entity_col",
-                help="Must be the primary key of the entity table. "
-                     "Change the PK in the 'Tables & primary keys' panel above.",
                 disabled=len(entity_cols) == 1,
             )
-        with qb_cols[3]:
+        with qb_row[1]:
             entity_val = st.text_input("Entity value", key="qb_entity_val")
 
-        qb_cols2 = st.columns(4)
-        with qb_cols2[0]:
-            agg = st.selectbox("Aggregation", options=["COUNT", "SUM", "AVG", "MIN", "MAX"], key="qb_agg")
-        with qb_cols2[1]:
-            start = st.number_input("Window start", value=0, step=1, key="qb_start")
-        with qb_cols2[2]:
-            end = st.number_input("Window end", value=30, step=1, key="qb_end")
-        with qb_cols2[3]:
-            unit = st.selectbox("Unit", options=["days", "hours", "weeks", "months"], key="qb_unit")
-
-        if agg == "COUNT":
-            agg_expr = f"COUNT({target_tbl}.*, {start}, {end}, {unit})"
-        else:
-            target_cols = list(st.session_state.uploaded_tables[target_tbl].columns)
+        if mode == "Static":
+            # PREDICT <entity_tbl>.<target_col> FOR <entity_tbl>.<pk>=<value>
+            entity_df = st.session_state.uploaded_tables[entity_tbl]
+            target_options = [c for c in entity_df.columns if c != entity_col]
             target_col = st.selectbox(
-                f"{agg} column (from {target_tbl})",
-                options=target_cols,
-                key="qb_target_col",
+                f"Target column (from {entity_tbl}) — the value to predict",
+                options=target_options,
+                key="qb_static_target",
             )
-            agg_expr = f"{agg}({target_tbl}.{target_col}, {start}, {end}, {unit})"
+            built = (
+                f"PREDICT {entity_tbl}.{target_col} "
+                f"FOR {entity_tbl}.{entity_col}={entity_val or '<value>'}"
+            )
+        else:
+            if not tables_with_time:
+                st.warning(
+                    "No table in this graph has a time column declared. "
+                    "Temporal queries will fail — set a time column in the metadata panel above, "
+                    "or switch to **Static** mode."
+                )
+            tgt_row = st.columns(4)
+            with tgt_row[0]:
+                target_tbl = st.selectbox(
+                    "Target table (child table with events)",
+                    options=st.session_state.graph_tables,
+                    key="qb_target_tbl",
+                )
+            with tgt_row[1]:
+                agg = st.selectbox(
+                    "Aggregation",
+                    options=["COUNT", "SUM", "AVG", "MIN", "MAX"],
+                    key="qb_agg",
+                )
+            with tgt_row[2]:
+                start = st.number_input("Window start", value=0, step=1, key="qb_start")
+            with tgt_row[3]:
+                end = st.number_input("Window end", value=30, step=1, key="qb_end")
 
-        threshold = st.text_input(
-            "Optional threshold (e.g. `> 0`, `>= 100`)",
-            key="qb_threshold",
-            value="> 0",
-        )
-        threshold_part = f" {threshold}" if threshold.strip() else ""
+            unit = st.selectbox(
+                "Unit",
+                options=["days", "hours", "weeks", "months"],
+                key="qb_unit",
+            )
 
-        built = f"PREDICT {agg_expr}{threshold_part} FOR {entity_tbl}.{entity_col}={entity_val or '<value>'}"
+            if agg == "COUNT":
+                agg_expr = f"COUNT({target_tbl}.*, {start}, {end}, {unit})"
+            else:
+                target_cols = list(st.session_state.uploaded_tables[target_tbl].columns)
+                target_col = st.selectbox(
+                    f"{agg} column (from {target_tbl})",
+                    options=target_cols,
+                    key="qb_target_col",
+                )
+                agg_expr = f"{agg}({target_tbl}.{target_col}, {start}, {end}, {unit})"
+
+            threshold = st.text_input(
+                "Optional threshold (e.g. `> 0`, `>= 100`)",
+                key="qb_threshold",
+                value="> 0",
+            )
+            threshold_part = f" {threshold}" if threshold.strip() else ""
+            built = (
+                f"PREDICT {agg_expr}{threshold_part} "
+                f"FOR {entity_tbl}.{entity_col}={entity_val or '<value>'}"
+            )
+
         st.code(built, language="sql")
         if st.button("Use this query", use_container_width=True):
             st.session_state.predict_query = built
