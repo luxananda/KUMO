@@ -64,6 +64,8 @@ for k, default in [
     ("graph_pks", {}),  # table_name -> primary_key_column
     ("graph_time_cols", {}),  # table_name -> time_column (or None)
     ("predict_result", None),
+    ("predict_summary", None),
+    ("explain_predictions", True),
     ("predict_query", "PREDICT COUNT(orders.*, 0, 30, days) > 0 FOR users.user_id=1"),
 ]:
     if k not in st.session_state:
@@ -695,27 +697,48 @@ if st.session_state.graph is not None:
              "Example: PREDICT COUNT(orders.*, 0, 30, days) > 0 FOR users.user_id=1",
     )
 
-    if st.button("▶ Run PREDICT", type="primary"):
+    run_col, explain_col = st.columns([1, 2])
+    with run_col:
+        run_clicked = st.button("▶ Run PREDICT", type="primary", use_container_width=True)
+    with explain_col:
+        st.checkbox(
+            "🧠 Explain the prediction (reasoning, cohort analysis, attributions)",
+            key="explain_predictions",
+            help="Uses KumoRFM's Explain mode. Adds ~5–10s per prediction. "
+                 "Only supported for single-entity predictions in FAST mode.",
+        )
+
+    if run_clicked:
         # Clean common whitespace issues around `.` and `=` that break the parser.
         import re
         raw_query = st.session_state.predict_query
-        cleaned = re.sub(r"\s*\.\s*", ".", raw_query)   # no spaces around '.'
-        cleaned = re.sub(r"\s*=\s*", "=", cleaned)       # no spaces around '='
+        cleaned = re.sub(r"\s*\.\s*", ".", raw_query)
+        cleaned = re.sub(r"\s*=\s*", "=", cleaned)
         cleaned = cleaned.strip()
 
         if cleaned != raw_query:
             st.caption(f"Auto-cleaned query: `{cleaned}`")
 
-        with st.spinner("Running prediction…"):
+        spinner_msg = "Running prediction with explanation…" if st.session_state.explain_predictions else "Running prediction…"
+        with st.spinner(spinner_msg):
             try:
                 model = rfm.KumoRFM(st.session_state.graph)
-                result = model.predict(cleaned)
-                st.session_state.predict_result = result
+                raw = model.predict(cleaned, explain=st.session_state.explain_predictions)
+
+                # With explain=True → Explanation object; otherwise → DataFrame.
+                if hasattr(raw, "prediction") and hasattr(raw, "summary"):
+                    st.session_state.predict_result = raw.prediction
+                    st.session_state.predict_summary = raw.summary
+                else:
+                    st.session_state.predict_result = raw
+                    st.session_state.predict_summary = None
             except Exception as e:
                 st.session_state.predict_result = None
+                st.session_state.predict_summary = None
                 st.error(f"Predict failed: {e}")
 
     result = st.session_state.predict_result
+    summary = st.session_state.predict_summary
     if result is not None:
         st.markdown("#### Result")
         if isinstance(result, pd.DataFrame):
@@ -725,3 +748,7 @@ if st.session_state.graph is not None:
                 st.dataframe(pd.DataFrame(result), use_container_width=True)
             except Exception:
                 st.code(repr(result))
+
+    if summary:
+        st.markdown("#### 🧠 Model explanation")
+        st.markdown(summary)
