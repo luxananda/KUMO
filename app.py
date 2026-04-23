@@ -67,7 +67,61 @@ for k, default in [
     if k not in st.session_state:
         st.session_state[k] = default
 
+KUMO_FIELDS = ["kumo_api_key"]
+BQ_FIELDS = ["project_id", "dataset_id", "sa_json"]
+
+
+def connect_kumo(api_key: str) -> tuple[bool, str]:
+    """Returns (ok, message)."""
+    try:
+        rfm.init(api_key=api_key)
+        return True, "KumoRFM initialized."
+    except Exception as e:
+        msg = str(e).lower()
+        if "already been initialized" in msg or "already initialized" in msg:
+            return True, (
+                "KumoRFM was already initialized in this process. "
+                "Restart Streamlit to switch API keys."
+            )
+        return False, f"rfm.init failed: {e}"
+
+
+def connect_bigquery(project_id: str, dataset_id: str, sa_json: str):
+    """Returns (client, tables, error_message). client/tables are None on failure."""
+    try:
+        sa_info = json.loads(sa_json)
+    except json.JSONDecodeError as e:
+        return None, None, f"Service Account JSON is not valid JSON: {e}"
+
+    pk = sa_info.get("private_key", "")
+    if "\\n" in pk and "\n" not in pk:
+        sa_info["private_key"] = pk.replace("\\n", "\n")
+        pk = sa_info["private_key"]
+
+    if not (pk.startswith("-----BEGIN") and "-----END" in pk and "..." not in pk):
+        return None, None, (
+            "The `private_key` field in your service-account JSON looks corrupted "
+            "(truncated, redacted, or had newlines stripped). "
+            "Use the file uploader instead of pasting."
+        )
+
+    try:
+        credentials = service_account.Credentials.from_service_account_info(sa_info)
+        client = bigquery.Client(project=project_id, credentials=credentials)
+    except Exception as e:
+        return None, None, f"BigQuery client failed: {e}"
+
+    try:
+        dataset_ref = bigquery.DatasetReference(project_id, dataset_id)
+        tables = sorted(t.table_id for t in client.list_tables(dataset_ref))
+    except Exception as e:
+        return None, None, f"list_tables failed: {e}"
+
+    return client, tables, None
+
+
 with st.sidebar:
+    # ──────────────────────────── KumoRFM ────────────────────────────
     st.header("1. KumoRFM")
     st.text_input(
         "Kumo API Key (JWT)",
@@ -77,16 +131,36 @@ with st.sidebar:
         help="Your KumoRFM free-trial / API key (JWT format).",
     )
 
+    k_save, k_connect = st.columns(2)
+    with k_save:
+        if st.button("💾 Save Kumo", use_container_width=True):
+            save_config({f: st.session_state[f] for f in FIELDS})
+            st.toast("Kumo key saved.", icon="✅")
+    with k_connect:
+        if st.button("🔌 Connect Kumo", type="primary", use_container_width=True):
+            if not st.session_state.kumo_api_key:
+                st.error("Enter the Kumo API key first.")
+            else:
+                ok, msg = connect_kumo(st.session_state.kumo_api_key)
+                st.session_state.rfm_ready = ok
+                (st.success if ok else st.error)(msg)
+
+    if st.session_state.rfm_ready:
+        st.caption("✅ KumoRFM connected")
+    else:
+        st.caption("⚪ Not connected to Kumo")
+
     st.divider()
-    st.header("2. BigQuery")
+
+    # ──────────────────────────── BigQuery ────────────────────────────
+    st.header("2. BigQuery (optional)")
     st.text_input("GCP Project ID", key="project_id", placeholder="onyx-smoke-486103-d1")
     st.text_input("BigQuery Dataset ID", key="dataset_id", placeholder="my_dataset")
 
     sa_upload = st.file_uploader(
         "Service Account JSON file (recommended)",
         type=["json"],
-        help="Upload the .json key file downloaded from GCP IAM → Service Accounts → Keys. "
-             "Avoids copy-paste errors that mangle the PEM private key.",
+        help="Upload the .json key file downloaded from GCP IAM → Service Accounts → Keys.",
     )
     if sa_upload is not None:
         try:
@@ -104,31 +178,39 @@ with st.sidebar:
             label_visibility="collapsed",
         )
 
-    col_save, col_clear = st.columns(2)
-    with col_save:
-        if st.button("💾 Save", use_container_width=True):
+    b_save, b_connect = st.columns(2)
+    with b_save:
+        if st.button("💾 Save BQ", use_container_width=True):
             save_config({f: st.session_state[f] for f in FIELDS})
-            st.toast(f"Saved to {CONFIG_PATH.name}", icon="✅")
-    with col_clear:
-        if st.button("🗑 Clear saved", use_container_width=True):
-            if CONFIG_PATH.exists():
-                CONFIG_PATH.unlink()
-            for f in FIELDS:
-                st.session_state[f] = ""
-            st.toast("Cleared.", icon="🧹")
-            st.rerun()
+            st.toast("BigQuery config saved.", icon="✅")
+    with b_connect:
+        if st.button("🔌 Connect BQ", type="primary", use_container_width=True):
+            if not (st.session_state.project_id and st.session_state.dataset_id and st.session_state.sa_json):
+                st.error("Fill Project, Dataset, and SA JSON first.")
+            else:
+                with st.spinner("Connecting to BigQuery…"):
+                    client, tbls, err = connect_bigquery(
+                        st.session_state.project_id,
+                        st.session_state.dataset_id,
+                        st.session_state.sa_json,
+                    )
+                if err:
+                    st.error(err)
+                else:
+                    st.session_state.bq_client = client
+                    st.session_state.bq_tables = tbls
+                    st.success(f"Connected. {len(tbls)} table(s) found.")
 
-    st.caption(
-        f"Values persist to `{CONFIG_PATH.name}` (gitignored)."
-        if CONFIG_PATH.exists()
-        else "Click Save to persist these values between reloads."
-    )
-
-    connect = st.button("Connect & list tables", type="primary", use_container_width=True)
+    if st.session_state.bq_client is not None:
+        st.caption(f"✅ BigQuery connected · {len(st.session_state.bq_tables)} tables")
+    else:
+        st.caption("⚪ Not connected to BigQuery")
 
     st.divider()
-    st.header("3. Upload files")
-    st.caption("CSV, TSV, or Excel. Each file becomes a table named after the file.")
+
+    # ──────────────────────────── Upload files ────────────────────────────
+    st.header("3. Upload CSV / Excel")
+    st.caption("Drop files to use them directly — no connection needed.")
     uploads = st.file_uploader(
         "Upload CSV / Excel",
         type=["csv", "tsv", "xlsx", "xls"],
@@ -146,94 +228,43 @@ with st.sidebar:
                 st.error(f"Failed to read {f.name}: {e}")
 
     if st.session_state.uploaded_tables:
-        st.caption(f"Loaded {len(st.session_state.uploaded_tables)} uploaded table(s).")
+        st.caption(f"✅ {len(st.session_state.uploaded_tables)} uploaded table(s)")
         if st.button("Clear uploaded", use_container_width=True):
             st.session_state.uploaded_tables = {}
             st.session_state.preview_df = None
             st.session_state.preview_table = None
             st.rerun()
 
+    st.divider()
+
+    # ──────────────────────────── Saved config ────────────────────────────
+    if CONFIG_PATH.exists():
+        st.caption(f"Saved values live in `{CONFIG_PATH.name}` (gitignored).")
+    if st.button("🗑 Clear all saved", use_container_width=True):
+        if CONFIG_PATH.exists():
+            CONFIG_PATH.unlink()
+        for f in FIELDS:
+            st.session_state[f] = ""
+        st.toast("Cleared all saved values.", icon="🧹")
+        st.rerun()
+
 kumo_api_key = st.session_state.kumo_api_key
 project_id = st.session_state.project_id
 dataset_id = st.session_state.dataset_id
 sa_json = st.session_state.sa_json
 
-if connect:
-    if not kumo_api_key:
-        st.error("Kumo API key is required.")
-        st.stop()
-
-    save_config({f: st.session_state[f] for f in FIELDS})
-
-    with st.spinner("Initializing KumoRFM…"):
-        try:
-            rfm.init(api_key=kumo_api_key)
-            st.session_state.rfm_ready = True
-        except Exception as e:
-            msg = str(e).lower()
-            if "already been initialized" in msg or "already initialized" in msg:
-                # RFM is a process-level singleton; Streamlit reruns the script
-                # on every interaction so a second init() call raises. Treat as ok.
-                st.session_state.rfm_ready = True
-                st.info(
-                    "KumoRFM was already initialized in this process — keeping the "
-                    "existing session. To switch API keys, restart the Streamlit server."
-                )
-            else:
-                st.session_state.rfm_ready = False
-                st.error(f"rfm.init failed: {e}")
-                st.stop()
-
-    # BigQuery is optional — only connect if all BQ fields are provided.
-    if project_id and dataset_id and sa_json:
-        try:
-            sa_info = json.loads(sa_json)
-        except json.JSONDecodeError as e:
-            st.error(f"Service Account JSON is not valid JSON: {e}")
-            st.stop()
-
-        pk = sa_info.get("private_key", "")
-        if "\\n" in pk and "\n" not in pk:
-            sa_info["private_key"] = pk.replace("\\n", "\n")
-            pk = sa_info["private_key"]
-
-        if not (pk.startswith("-----BEGIN") and "-----END" in pk and "..." not in pk):
-            st.error(
-                "The `private_key` field in your service-account JSON looks corrupted "
-                "(truncated, redacted, or had newlines stripped). "
-                "**Tip:** use the file uploader above instead of pasting — it avoids this. "
-                "Or re-download the key JSON from GCP IAM and re-paste it raw."
-            )
-            st.stop()
-
-        with st.spinner("Connecting to BigQuery…"):
-            try:
-                credentials = service_account.Credentials.from_service_account_info(sa_info)
-                client = bigquery.Client(project=project_id, credentials=credentials)
-            except Exception as e:
-                st.error(f"BigQuery client failed: {e}")
-                st.stop()
-
-        with st.spinner(f"Listing tables in {project_id}.{dataset_id}…"):
-            try:
-                dataset_ref = bigquery.DatasetReference(project_id, dataset_id)
-                tables = sorted(t.table_id for t in client.list_tables(dataset_ref))
-            except Exception as e:
-                st.error(f"list_tables failed: {e}")
-                st.stop()
-
-        st.session_state.bq_client = client
-        st.session_state.bq_tables = tables
-        st.success(f"Connected. Found {len(tables)} BQ table(s). KumoRFM initialized.")
-    else:
-        st.success("KumoRFM initialized. (BigQuery skipped — fill those fields to list BQ tables.)")
-
 client = st.session_state.bq_client
 bq_tables = st.session_state.bq_tables
 uploaded_tables = st.session_state.uploaded_tables
 
-if not st.session_state.rfm_ready and not uploaded_tables:
-    st.info("Enter your KumoRFM API key in the sidebar (BigQuery optional), then click **Connect**. Or upload a CSV/Excel.")
+if not bq_tables and not uploaded_tables:
+    st.info(
+        "Nothing loaded yet. In the sidebar:\n\n"
+        "- **1. KumoRFM** — paste your JWT, then click **🔌 Connect Kumo** (needed to run PREDICT).\n"
+        "- **2. BigQuery** — (optional) connect to browse tables.\n"
+        "- **3. Upload CSV / Excel** — drop files to use them directly.\n\n"
+        "You need tables loaded before the Build Graph & Predict panel appears."
+    )
     st.stop()
 
 # Build a combined table list with type tags.

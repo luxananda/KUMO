@@ -40,6 +40,23 @@ Opens at http://localhost:8501.
 
 Click **💾 Save** to persist these in `.kumo_config.json` (gitignored). Click **Connect & list tables**.
 
+## Deploy to Railway
+
+This repo ships with `Procfile`, `railway.toml`, and `runtime.txt` for Railway.
+
+1. In Railway: **New Project → Deploy from GitHub repo → `luxananda/KUMO`**.
+2. Railway will `pip install -r requirements.txt` and run the start command from `railway.toml`:
+   ```
+   streamlit run app.py --server.port $PORT --server.address 0.0.0.0 --server.headless true
+   ```
+3. In the service's **Settings → Networking → Generate Domain** to get a public URL.
+4. Open the domain — the sidebar asks for credentials at runtime, so nothing is baked into the image.
+
+**Gotchas if "Application failed to respond":**
+- Make sure `--server.port $PORT --server.address 0.0.0.0` are on the start command (Streamlit defaults to `localhost:8501`, which Railway can't reach).
+- Check build logs: `kumoai` needs Python 3.10+; `runtime.txt` pins 3.11.
+- Streamlit health check lives at `/_stcore/health`.
+
 ## What v1 does
 
 - Init KumoRFM SDK with your JWT
