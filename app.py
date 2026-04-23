@@ -61,6 +61,7 @@ for k, default in [
     ("preview_table", None),
     ("graph", None),
     ("graph_tables", []),  # names in the built graph
+    ("graph_pks", {}),  # table_name -> primary_key_column
     ("predict_result", None),
     ("predict_query", "PREDICT COUNT(orders.*, 0, 30, days) > 0 FOR users.user_id=1"),
 ]:
@@ -400,19 +401,60 @@ with cols[1]:
     st.write("")
     build_clicked = st.button("🔨 Build graph", use_container_width=True, disabled=not chosen)
 
+def guess_primary_key(df: pd.DataFrame, table_name: str) -> str:
+    """Heuristic PK pick: prefer an id-like column, unique, otherwise first column."""
+    cols = list(df.columns)
+    lower = [c.lower() for c in cols]
+    # 1. Exact '<table>id' match, e.g. churn -> customerid isn't this, but users -> userid is
+    for c, lc in zip(cols, lower):
+        if lc == f"{table_name.lower()}id" or lc == f"{table_name.lower()}_id":
+            if df[c].is_unique:
+                return c
+    # 2. Anything ending with 'id' that's unique
+    for c, lc in zip(cols, lower):
+        if lc.endswith("id") and df[c].is_unique:
+            return c
+    # 3. Column literally named 'id'
+    for c, lc in zip(cols, lower):
+        if lc == "id" and df[c].is_unique:
+            return c
+    # 4. First unique column
+    for c in cols:
+        if df[c].is_unique:
+            return c
+    # 5. Fallback: first column
+    return cols[0]
+
+
 if build_clicked:
     with st.spinner("Building graph…"):
         try:
             tables_dict = {n: st.session_state.uploaded_tables[n] for n in chosen}
             graph = rfm.Graph.from_data(tables_dict)
+
+            # Auto-assign a primary key per table — required for FOR clauses.
+            pk_guesses = {}
+            for name in chosen:
+                pk = guess_primary_key(tables_dict[name], name)
+                try:
+                    graph.table(name).primary_key = pk
+                    pk_guesses[name] = pk
+                except Exception as e:
+                    st.warning(f"Couldn't set PK on {name}: {e}")
+
             try:
                 graph.validate()
             except Exception as ve:
                 st.warning(f"Graph validation warning: {ve}")
+
             st.session_state.graph = graph
             st.session_state.graph_tables = chosen
+            st.session_state.graph_pks = pk_guesses
             st.session_state.predict_result = None
-            st.success(f"Graph built with {len(chosen)} table(s): {', '.join(chosen)}")
+            st.success(
+                f"Graph built with {len(chosen)} table(s): {', '.join(chosen)} · "
+                f"PKs: {', '.join(f'{t}.{pk_guesses[t]}' for t in chosen)}"
+            )
         except Exception as e:
             st.session_state.graph = None
             st.error(f"Graph build failed: {e}")
@@ -426,12 +468,43 @@ if st.session_state.graph is not None:
         except Exception:
             pass
 
-    # Show each table's columns so the user knows exactly what to type in PQL.
-    with st.expander("Tables & columns in this graph", expanded=True):
+    # Show each table's columns + primary key. PQL FOR clause requires a PK.
+    with st.expander("Tables & primary keys", expanded=True):
+        st.caption(
+            "The `FOR` clause must reference a **primary key** column. "
+            "Override the auto-picked PK below if needed, then click **Apply PKs**."
+        )
+        pk_override = {}
         for t in st.session_state.graph_tables:
             df = st.session_state.uploaded_tables[t]
-            cols_formatted = ", ".join(f"`{t}.{c}`" for c in df.columns)
-            st.markdown(f"**{t}** ({len(df):,} rows) — {cols_formatted}")
+            current_pk = st.session_state.graph_pks.get(t, df.columns[0])
+            cols = list(df.columns)
+            idx = cols.index(current_pk) if current_pk in cols else 0
+            c1, c2 = st.columns([1, 2])
+            with c1:
+                st.markdown(f"**{t}** ({len(df):,} rows)")
+            with c2:
+                pk_override[t] = st.selectbox(
+                    f"Primary key for `{t}`",
+                    options=cols,
+                    index=idx,
+                    key=f"pk_select_{t}",
+                    label_visibility="collapsed",
+                )
+            st.caption("Columns: " + ", ".join(f"`{t}.{c}`" for c in df.columns))
+
+        if st.button("Apply PKs", use_container_width=True):
+            for name, pk in pk_override.items():
+                try:
+                    st.session_state.graph.table(name).primary_key = pk
+                except Exception as e:
+                    st.error(f"Failed to set PK on {name}: {e}")
+            st.session_state.graph_pks = pk_override
+            try:
+                st.session_state.graph.validate()
+                st.success(f"PKs applied: {', '.join(f'{t}.{pk}' for t, pk in pk_override.items())}")
+            except Exception as ve:
+                st.warning(f"Graph validation warning: {ve}")
 
     st.markdown("#### PREDICT query (PQL)")
 
@@ -459,13 +532,19 @@ if st.session_state.graph is not None:
                 key="qb_entity_tbl",
                 help="The table whose rows you're predicting for.",
             )
-        entity_cols = list(st.session_state.uploaded_tables[entity_tbl].columns)
+        # Entity column must be the primary key of the entity table.
+        pk_for_entity = st.session_state.graph_pks.get(entity_tbl)
+        entity_cols = [pk_for_entity] if pk_for_entity else list(
+            st.session_state.uploaded_tables[entity_tbl].columns
+        )
         with qb_cols[2]:
             entity_col = st.selectbox(
-                "Entity column",
+                "Entity column (PK)",
                 options=entity_cols,
                 key="qb_entity_col",
-                help="Typically the primary key column.",
+                help="Must be the primary key of the entity table. "
+                     "Change the PK in the 'Tables & primary keys' panel above.",
+                disabled=len(entity_cols) == 1,
             )
         with qb_cols[3]:
             entity_val = st.text_input("Entity value", key="qb_entity_val")
