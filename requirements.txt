@@ -1,0 +1,6 @@
+kumoai
+streamlit
+pandas
+google-cloud-bigquery
+db-dtypes
+openpyxl
